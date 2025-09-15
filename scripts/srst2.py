@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env pythonWHI
 
 # SRST2 - Short Read Sequence Typer (v2)
 # Python Version 2.7.5
@@ -28,6 +28,10 @@ from math import log
 from itertools import groupby
 from operator import itemgetter
 from collections import OrderedDict
+#>---- NGG-----------------------------------------
+from collections import defaultdict
+#<---- NGG-----------------------------------------
+
 try:
 	from version import srst2_version
 except:
@@ -310,6 +314,68 @@ def parse_fai(fai_file,db_type,delimiter):
 
 	return size, gene_clusters, unique_gene_symbols, unique_allele_symbols, gene_cluster_symbols
 
+#> --- NGG-----------------------------------------
+
+def detect_truncations_in_pileup(pileup_path, ref_lengths):
+	"""
+	Marks truncated references if there is an internal position where >=95% of reads end ('$').
+	Returns a dict: {ref: truncated_pos}
+	"""
+	trunc_by_ref = {}  # Dictionary to store truncation info per reference
+	if not os.path.exists(pileup_path):  # If pileup file doesn't exist, return empty dict
+		return trunc_by_ref
+
+	END_FRAC_THRESHOLD = 0.95  # Fraction threshold for read ends to consider truncation
+	MIN_DEPTH = 10             # Minimum depth required to consider a position
+	EDGE_PAD = 10              # Ignore positions within this many bases of the edge
+
+	with open(pileup_path, 'r') as f:  # Open pileup file for reading
+		for line in f:  # Iterate over each line in the pileup
+			if not line.strip() or line.startswith('#'):  # Skip empty lines and comments
+				continue
+			parts = line.rstrip('\n').split('\t')  # Split line into fields
+
+			"""
+			13__TetM_Tet__TetM__831	1	A	1	^H.	I
+			13__TetM_Tet__TetM__831	2	T	3	.^H.^H.	III
+			13__TetM_Tet__TetM__831	3	G	4	...^~.	IIII
+			"""
+
+			if len(parts) < 5:  # Skip lines that don't have enough fields
+				continue
+			ref = parts[0]  # Reference name
+			try:
+				pos = int(parts[1])  # Position in reference
+				depth = int(parts[3])  # Read depth at this position
+			except:
+				continue  # Skip lines with invalid position or depth
+			if depth < MIN_DEPTH:  # Skip positions with low coverage
+				continue
+
+			L = ref_lengths.get(ref)  # Get reference length
+			if L is not None:
+				if pos <= EDGE_PAD or pos >= (L - EDGE_PAD + 1):  # Skip edge positions
+					continue
+
+			bases = parts[4]  # Aligned bases string
+			end_count = bases.count('$')  # Count number of reads ending at this position
+			frac_end = end_count / float(depth) if depth > 0 else 0.0  # Fraction of reads ending here
+			# If the fraction of reads ending at this position exceeds the threshold,
+			# update trunc_by_ref for this reference if:
+			# - no previous truncation was recorded,
+			# - this position has a higher fraction of ends,
+			# - or, in case of a tie in fraction, this position has greater depth.
+			if frac_end >= END_FRAC_THRESHOLD:
+				prev = trunc_by_ref.get(ref)
+				if prev is None:
+					trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
+				elif frac_end > prev['frac']:
+					trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
+				elif frac_end == prev['frac'] and depth > prev['depth']:
+					trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
+	return trunc_by_ref  # Return dictionary of truncation positions per reference
+
+#<--- NGG-----------------------------------------
 
 def read_pileup_data(pileup_file, size, prob_err, consensus_file = ""):
 	with open(pileup_file) as pileup:
@@ -499,7 +565,6 @@ def read_pileup_data(pileup_file, size, prob_err, consensus_file = ""):
 
 	return hash_alignment, hash_max_depth, hash_edge_depth, avg_depth_allele, coverage_allele, mismatch_allele, indel_allele, missing_allele, size_allele, next_to_del_depth_allele
 
-
 def score_alleles(args, mapping_files_pre, hash_alignment, hash_max_depth, hash_edge_depth,
 		avg_depth_allele, coverage_allele, mismatch_allele, indel_allele, missing_allele,
 		size_allele, next_to_del_depth_allele, run_type,unique_gene_symbols, unique_allele_symbols):
@@ -686,6 +751,11 @@ def run_bowtie(mapping_files_pre,sample_name,fastqs,args,db_name,db_full_path):
 	command += ['-S', sam,
 				'-' + args.read_type,	# add a dash to the front of the option
 				'--very-sensitive-local',
+##>-------- NGG -------------------------------
+#				#'--end-to-end',
+#				'--no-discordant', #Concordant pairs match pair expectations, discordant pairs don't
+#				'--no-mixed ',
+##<-------- NGG -------------------------------
 				'--no-unal',
 				'-a',					 # Search for and report all alignments
 				'-x', db_full_path			   # The index to be aligned to
@@ -723,11 +793,61 @@ def get_samtools_exec():
 	else:
 		return 'samtools'
 
+##>----------- NGG-------------------
+#def filter_softclipped_pairs_sam(sam_in, sam_out):
+#
+#    # Leer el SAM
+#    with open(sam_in, 'r') as infile:
+#        lines = infile.readlines()
+#
+#    # Separar encabezado y alineamientos
+#    header = [line for line in lines if line.startswith('@')]
+#    alignments = [line for line in lines if not line.startswith('@')]
+#
+#    # Agrupar por nombre de lectura
+#    read_pairs = defaultdict(list)
+#    for line in alignments:
+#        fields = line.strip().split('\t')
+#        qname = fields[0]
+#        read_pairs[qname].append(line)
+#
+#    # Filtrar pares
+#    filtered_lines = []
+#    for qname, pair in read_pairs.items():
+#        softclipped = False
+#        for line in pair:
+#            fields = line.strip().split('\t')
+#            cigar = fields[5]
+#            if 'S' in cigar:
+#                softclipped = True
+#                break
+#        if not softclipped:
+#            filtered_lines.extend(pair)
+#
+#    # Escribir el SAM filtrado
+#    with open(sam_out, 'w') as outfile:
+#        outfile.writelines(header + filtered_lines)
+#
+#
+##<----------- NGG-------------------
+
 def get_pileup(args, mapping_files_pre, raw_bowtie_sam, bowtie_sam_mod, fasta, pileup_file):
 	# Analyse output with SAMtools
 	samtools_exec = get_samtools_exec()
 	samtools_v1 = check_samtools_version().split('.')[0] == '1'  # Usage changed in version 1.0
 	logging.info('Processing Bowtie2 output with SAMtools...')
+##>------------ NGG ---------------------------------------	
+#	#antes de que haga el bam final
+#
+#	# Filtrar el SAM original
+#	filtered_sam = bowtie_sam_mod.replace('.sam', '.filtered.sam')
+#	filter_softclipped_pairs_sam(bowtie_sam_mod, filtered_sam)
+#
+#	# Usar el SAM filtrado para el resto del analisis
+#	bowtie_sam_mod = filtered_sam
+#
+##<------------ NGG ---------------------------------------
+
 	logging.info('Generate and sort BAM file...')
 	out_file_bam = mapping_files_pre + ".unsorted.bam"
 	view_command = [samtools_exec, 'view']
@@ -735,6 +855,7 @@ def get_pileup(args, mapping_files_pre, raw_bowtie_sam, bowtie_sam_mod, fasta, p
 		view_command += ['-@', str(args.threads)]
 	view_command += ['-b', '-o', out_file_bam, '-q', str(args.mapq), '-S', bowtie_sam_mod]
 	run_command(view_command)
+
 	out_file_bam_sorted = mapping_files_pre + ".sorted"
 	sort_command = [samtools_exec, 'sort']
 	if samtools_v1:
@@ -1421,6 +1542,12 @@ def map_fileSet_to_db(args, sample_name, fastq_inputs, db_name, fasta, size, gen
 				mismatch_allele, indel_allele, missing_allele, size_allele, next_to_del_depth_allele= \
 				read_pileup_data(pileup_file, size, args.prob_err)
 
+#>---NGG ------------------------------------------------------
+		# Detectar truncaciones en el pileup
+		trunc_by_ref = detect_truncations_in_pileup(pileup_file, size)
+		#print("Truncados detectados:", trunc_by_ref.keys())
+#<---NGG ------------------------------------------------------
+
 		# Generate scores for all alleles (prints these and associated info if verbose)
 		#   result = dict, with key=allele, value=score
 		logging.info(' Scoring alleles...')
@@ -1483,6 +1610,7 @@ def map_fileSet_to_db(args, sample_name, fastq_inputs, db_name, fasta, size, gen
 			(allele,diffs,depth_problem,divergence) = allele_scores[gene] # gene = top scoring alleles for each cluster
 			gene_name, allele_name, cluster_id, seqid = \
 				get_allele_name_from_db(allele,run_type,args,unique_allele_symbols,unique_gene_symbols)
+			#NGG -> print("Procesando gen y allele:", gene, allele)
 
 			# store for gene result table only if divergence passes minimum threshold:
 			if divergence*100 <= float(args.max_divergence):
@@ -1492,6 +1620,15 @@ def map_fileSet_to_db(args, sample_name, fastq_inputs, db_name, fasta, size, gen
 					results[sample_name][column_header] += "*"
 				if depth_problem != "":
 					results[sample_name][column_header] += "?"
+				#>---NGG ------------------------------------------------------
+				# Anyade *trunc si el gen esta truncado
+				if allele in trunc_by_ref.keys():
+					#results[sample_name][column_header] += "*trunc" # para report genes
+					# print("Gen truncado detectado:", allele, "->", results[sample_name][column_header])
+					#allele_name += "*trunc"  # <-- Anyade aqui para fullgenes
+					diffs += ";TRUNCATED" 
+
+				#<---NGG ------------------------------------------------------
 				if column_header not in gene_list:
 					gene_list.append(column_header)
 
