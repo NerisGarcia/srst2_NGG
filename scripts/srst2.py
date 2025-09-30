@@ -1,4 +1,4 @@
-#!/usr/bin/env pythonWHI
+#!/usr/bin/env python
 
 # SRST2 - Short Read Sequence Typer (v2)
 # Python Version 2.7.5
@@ -316,63 +316,135 @@ def parse_fai(fai_file,db_type,delimiter):
 
 #> --- NGG-----------------------------------------
 
+
 def detect_truncations_in_pileup(pileup_path, ref_lengths):
 	"""
-	Marks truncated references if there is an internal position where >=95% of reads end ('$').
-	Returns a dict: {ref: truncated_pos}
+	Marks truncated references if there is an internal position where reads end ($).
+	
+	Enhanced truncation detection to reduce false positives
+	Uses dual criteria approach:
+	1. High fraction of reads ending at position (≥75%)
+	2. For moderate fractions (75-90%): requires significant coverage drop after position
+	3. For very high fractions (≥90%): accepts without coverage drop confirmation
+	
+	This prevents false truncations when full-length and truncated reads co-map
+	to the same position, which inflates non-clipped read counts.
+	
+	Returns a dict: {ref: {'pos': position, 'frac': fraction, 'depth': depth}}
 	"""
 	trunc_by_ref = {}  # Dictionary to store truncation info per reference
 	if not os.path.exists(pileup_path):  # If pileup file doesn't exist, return empty dict
 		return trunc_by_ref
 
-	END_FRAC_THRESHOLD = 0.95  # Fraction threshold for read ends to consider truncation
-	MIN_DEPTH = 10             # Minimum depth required to consider a position
-	EDGE_PAD = 10              # Ignore positions within this many bases of the edge
+	# Threshold parameters for enhanced truncation detection
+	HIGH_END_FRAC_THRESHOLD = 0.75   # Minimum threshold for read ends (75%) - lowered from original 90%
+	VERY_HIGH_END_FRAC = 0.90        # Very high threshold - no coverage drop needed (90%) - addition
+	COVERAGE_DROP_RATIO = 3.0        # Coverage must drop by at least 3-fold - addition for confirmation
+	#MIN_DEPTH = 10                   # Minimum depth required to consider a position
+	EDGE_PAD = 10                    # Ignore positions within this many bases of the edge
+	WINDOW_SIZE = 10                  # Look ahead window to check coverage drop - addition
 
-	with open(pileup_path, 'r') as f:  # Open pileup file for reading
-		for line in f:  # Iterate over each line in the pileup
-			if not line.strip() or line.startswith('#'):  # Skip empty lines and comments
+	# Two-pass approach for better analysis
+	# First pass: collect all pileup data organized by reference
+	# This allows us to look ahead for coverage drops (original was single-pass)
+	ref_data = defaultdict(list)
+	
+	with open(pileup_path, 'r') as f:
+		for line in f:
+			if not line.strip() or line.startswith('#'):
 				continue
-			parts = line.rstrip('\n').split('\t')  # Split line into fields
-
-			"""
-			13__TetM_Tet__TetM__831	1	A	1	^H.	I
-			13__TetM_Tet__TetM__831	2	T	3	.^H.^H.	III
-			13__TetM_Tet__TetM__831	3	G	4	...^~.	IIII
-			"""
-
-			if len(parts) < 5:  # Skip lines that don't have enough fields
+			parts = line.rstrip('\n').split('\t')
+			
+			if len(parts) < 5:
 				continue
-			ref = parts[0]  # Reference name
+			ref = parts[0]
 			try:
-				pos = int(parts[1])  # Position in reference
-				depth = int(parts[3])  # Read depth at this position
+				pos = int(parts[1]) # position in reference
+				depth = int(parts[3]) # Depth at this position
+				bases = parts[4] if len(parts) > 4 else ""  # Handle missing bases column
 			except:
-				continue  # Skip lines with invalid position or depth
-			if depth < MIN_DEPTH:  # Skip positions with low coverage
 				continue
-
-			L = ref_lengths.get(ref)  # Get reference length
-			if L is not None:
-				if pos <= EDGE_PAD or pos >= (L - EDGE_PAD + 1):  # Skip edge positions
-					continue
-
-			bases = parts[4]  # Aligned bases string
-			end_count = bases.count('$')  # Count number of reads ending at this position
-			frac_end = end_count / float(depth) if depth > 0 else 0.0  # Fraction of reads ending here
-			# If the fraction of reads ending at this position exceeds the threshold,
-			# update trunc_by_ref for this reference if:
-			# - no previous truncation was recorded,
-			# - this position has a higher fraction of ends,
-			# - or, in case of a tie in fraction, this position has greater depth.
-			if frac_end >= END_FRAC_THRESHOLD:
-				prev = trunc_by_ref.get(ref)
-				if prev is None:
-					trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
-				elif frac_end > prev['frac']:
-					trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
-				elif frac_end == prev['frac'] and depth > prev['depth']:
-					trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
+				
+			# Store all position data for later analysis
+			ref_data[ref].append({
+				'pos': pos,
+				'depth': depth,
+				'bases': bases
+			})
+	
+	# Second pass: analyze each reference for truncations
+	for ref, positions in ref_data.items():
+		L = ref_lengths.get(ref)
+		if L is None:
+			continue
+			
+		# Sort positions by coordinate
+		positions.sort(key=lambda x: x['pos'])
+		
+		for i, pos_data in enumerate(positions):
+			pos = pos_data['pos']
+			depth = pos_data['depth']
+			bases = pos_data['bases']
+			
+			# Skip positions that don't meet basic criteria
+			if depth < MIN_DEPTH:
+				continue
+			if L is not None and (pos <= EDGE_PAD or pos >= (L - EDGE_PAD + 1)):
+				continue
+				
+			# Count reads ending at this position
+			end_count = bases.count('$')
+			frac_end = end_count / float(depth) if depth > 0 else 0.0
+			
+			# Check if this position has sufficient fraction of read ends
+			if frac_end >= HIGH_END_FRAC_THRESHOLD:
+				# Dual criteria approach based on user requirements:
+				# 1. If ≥90% of reads end here, it's a truncation (no coverage drop needed)
+				# 2. If 75-90% of reads end here, check for coverage drop to confirm
+				
+				is_likely_truncation = False
+				
+				if frac_end >= VERY_HIGH_END_FRAC:
+					# Very high fraction (≥90%) - accept as truncation without additional checks
+					# This handles clear truncations where almost all reads end
+					is_likely_truncation = True
+				else:
+					# Moderate fraction (75-90%) - require coverage drop confirmation
+					# This prevents false positives from mixed full/truncated read scenarios
+					coverage_drop_confirmed = False
+					
+					# Look at the next few positions to confirm coverage drop
+					for j in range(i + 1, min(i + 1 + WINDOW_SIZE, len(positions))):
+						next_pos_data = positions[j]
+						next_pos = next_pos_data['pos']
+						next_depth = next_pos_data['depth']
+						
+						# Only consider consecutive or very close positions
+						if next_pos > pos + WINDOW_SIZE:
+							break
+						
+						# Skip very low coverage positions in the comparison
+						if next_depth < 5:
+							continue
+							
+						# Check if coverage dropped significantly (at least 3-fold reduction)
+						# This confirms true truncation vs. mixed mapping scenarios
+						if depth >= next_depth * COVERAGE_DROP_RATIO:
+							coverage_drop_confirmed = True
+							break
+					
+					is_likely_truncation = coverage_drop_confirmed
+				
+				# Store truncation if confirmed by either high fraction or coverage drop
+				if is_likely_truncation:
+					prev = trunc_by_ref.get(ref)
+					if prev is None:
+						trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
+					elif frac_end > prev['frac']:
+						trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
+					elif frac_end == prev['frac'] and depth > prev['depth']:
+						trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
+	
 	return trunc_by_ref  # Return dictionary of truncation positions per reference
 
 #<--- NGG-----------------------------------------
@@ -752,11 +824,11 @@ def run_bowtie(mapping_files_pre,sample_name,fastqs,args,db_name,db_full_path):
 				'-' + args.read_type,	# add a dash to the front of the option
 				'--very-sensitive-local',
 ##>-------- NGG -------------------------------
-#				#'--end-to-end',
+#				'--end-to-end',
 #				'--no-discordant', #Concordant pairs match pair expectations, discordant pairs don't
 #				'--no-mixed ',
 ##<-------- NGG -------------------------------
-				'--no-unal',
+				'--no-unal',  #Suppress SAM records for reads that failed to align
 				'-a',					 # Search for and report all alignments
 				'-x', db_full_path			   # The index to be aligned to
 			   ]

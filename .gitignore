@@ -58,3 +58,6 @@ data/*.fai
 # who creates that one?
 .cache
 
+#NGG datbase files
+NGG_db/
+

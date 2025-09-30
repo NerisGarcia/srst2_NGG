@@ -1,0 +1,34 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python Debugger: transform_fasta_headers.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "NGG_code/transform_fasta_headers.py",
+      "console": "integratedTerminal",
+      "args": [
+        "NGG_db/tetM_alleles_nuc.NGG_db.fasta",
+        "-o",
+        "NGG_db/output.fasta",
+        "--amrfplus-fam-tab",
+        "/home/ngarcia/miniconda3/envs/genomics_env/share/amrfinderplus/data/2024-07-22.1/fam.tab"
+      ]
+    },
+    {
+      "name": "Python Debugger: cdhit_to_csv.py",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "database_clustering/cdhit_to_csv.py",
+      "console": "integratedTerminal",
+      "args": [
+        "--cluster_file",
+        "AMR_CDS_plus.cdhit90.clstr",
+        "--infasta",
+        "AMR_CDS_plus_tetLMS.def.fasta",
+        "--outfile",
+        "AMR_CDS_plus.clustered.csv"
+      ]
+    }
+  ]
+}
