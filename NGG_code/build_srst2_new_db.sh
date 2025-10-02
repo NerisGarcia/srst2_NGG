@@ -4,14 +4,17 @@
 # Using the AMRFinderPlus database as reference:
 # /home/ngarcia/miniconda3/envs/genomics_env/share/amrfinderplus/data/2024-07-22.1
 
+# Source the environment file
+source "$(dirname "$0")/env"
+
 # Move to the working directory for the new database
-cd /home/ngarcia/RESEARCH/Projects/2024_AMR_Enteroccoco/Goals/srst2_NGG/NGG_db/
+cd "${NGG_DB_PATH}"
 
 # Remove all files in the current directory to start fresh
 rm *
 
 # Copy the latest AMR_CDS file from AMRFinderPlus data to the working directory
-cp /home/ngarcia/miniconda3/envs/genomics_env/share/amrfinderplus/data/latest/AMR_CDS /home/ngarcia/RESEARCH/Projects/2024_AMR_Enteroccoco/Goals/srst2_NGG/NGG_db
+cp "${AMRFINDER_AMR_CDS}" "${NGG_DB_PATH}"
 
 # List files to confirm copy
 ls
@@ -26,7 +29,7 @@ conda activate genomics_env
 for gene in "tet(M)" "tet(L)" "tet(S)" "erm(B)" "sat4" "aph(3')-IIIa" "ant(6)-Ia"; do
     
     # Set input and output FASTA filenames for each gene
-    input_fasta="/home/ngarcia/RESEARCH/Projects/2024_AMR_Enteroccoco/Goals/Tet_resistance/data/00_tet_variant_catalog/02_final_tet_alleles/${gene}_alleles_nuc.fasta"
+    input_fasta="${TET_VARIANTS_PATH}/${gene}_alleles_nuc.fasta"
     output_fasta="${gene}_alleles_nuc.NGG_db.fasta"
     edited_fasta="${gene}_alleles_nuc.NGG_db.editednames.fasta"
     
@@ -34,7 +37,7 @@ for gene in "tet(M)" "tet(L)" "tet(S)" "erm(B)" "sat4" "aph(3')-IIIa" "ant(6)-Ia
     sed "s/|AMR_ref_gene_catalog/|${gene}|AMR_ref_gene_catalog/" "$input_fasta" > "$output_fasta"
 
     # Transform headers to AMRFinderPlus format using a custom Python script
-    python ../NGG_code/transform_fasta_headers.py "$output_fasta" -o "$edited_fasta" --amrfplus-fam-tab /home/ngarcia/miniconda3/envs/genomics_env/share/amrfinderplus/data/latest/fam.tab
+    python ../NGG_code/transform_fasta_headers.py "$output_fasta" -o "$edited_fasta" --amrfplus-fam-tab "${AMRFINDER_FAM_TAB}"
 
     # For aph(3')-IIIa, replace special characters in the header for compatibility
     if [ "$gene" == "aph(3')-IIIa" ]; then
@@ -115,10 +118,10 @@ cd-hit-est -i AMR_CDS_plus_tetLMS.def.nogaps.nosym.fasta -o AMR_CDS_plus.cdhit90
 cat AMR_CDS_plus.cdhit90.stdout
 
 # Convert CD-HIT cluster file to CSV using a custom Python script
-python ../database_clustering/cdhit_to_csv.py --cluster_file AMR_CDS_plus.cdhit90.clstr --infasta AMR_CDS_plus_tetLMS.def.nogaps.nosym.fasta --outfile AMR_CDS_plus.clustered.csv
+python "${DATABASE_CLUSTERING_PATH}/cdhit_to_csv.py" --cluster_file AMR_CDS_plus.cdhit90.clstr --infasta AMR_CDS_plus_tetLMS.def.nogaps.nosym.fasta --outfile AMR_CDS_plus.clustered.csv
 
 # Generate clustered gene database FASTA from CSV using a custom Python script
-python ../database_clustering/csv_to_gene_db.py -t AMR_CDS_plus.clustered.csv -o AMR_CDS_plus.clustered.fasta -f AMR_CDS_plus_tetLMS.def.nogaps.nosym.fasta -c 4
+python "${DATABASE_CLUSTERING_PATH}/csv_to_gene_db.py" -t AMR_CDS_plus.clustered.csv -o AMR_CDS_plus.clustered.fasta -f AMR_CDS_plus_tetLMS.def.nogaps.nosym.fasta -c 4
 # The output FASTA (seqs_clustered.fasta) is ready for SRST2 (--gene_db).
 
 # Build Bowtie2 index for the clustered gene database

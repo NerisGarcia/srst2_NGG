@@ -1,63 +1,13 @@
-#vim backup files
-*~
-*.swp
+# Environment and sensitive files
+/NGG_code/env
+/NGG_code/tests.sh
 
-#python compiled files
-*.py[cod]
-scripts/*.py[cod]
-
-# Packages
-*.egg
-*.egg-info
-dist
-build
-eggs
-sdist
-develop-eggs
-.installed.cfg
-__pycache__
-
-# Installer logs
-pip-log.txt
-
-# Translations
-*.mo
-
-# Compiled Object files
-*.slo
-*.lo
-*.o
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-
-#VStudio parsed headers
-ipch/
-
-files_vs2010.*
-
-#PyCharm IDE files
-.idea
-
-#MacOS crud
-.DS_Store
-
-# our test run dirs
-test_run/
-
-# Bowtie index files
-data/*.bt2
-data/*.fai
-
-# who creates that one?
-.cache
-
-#NGG datbase files
-NGG_db/
+# Build artifacts and databases
+/NGG_db/
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+/data/*.bt2
+/data/*.fai
 
