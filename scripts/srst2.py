@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 #!/usr/bin/env python
 
 # SRST2 - Short Read Sequence Typer (v2)
@@ -23,6 +24,7 @@ from argparse import (ArgumentParser, FileType)
 import logging
 from subprocess import call, check_output, CalledProcessError, STDOUT
 import os, sys, re, collections, operator
+from scipy import size
 from scipy.stats import binom, linregress
 from math import log
 from itertools import groupby
@@ -318,135 +320,201 @@ def parse_fai(fai_file,db_type,delimiter):
 
 
 def detect_truncations_in_pileup(pileup_path, ref_lengths):
-	"""
-	Marks truncated references if there is an internal position where reads end ($).
-	
-	Enhanced truncation detection to reduce false positives
-	Uses dual criteria approach:
-	1. High fraction of reads ending at position (≥75%)
-	2. For moderate fractions (75-90%): requires significant coverage drop after position
-	3. For very high fractions (≥90%): accepts without coverage drop confirmation
-	
-	This prevents false truncations when full-length and truncated reads co-map
-	to the same position, which inflates non-clipped read counts.
-	
-	Returns a dict: {ref: {'pos': position, 'frac': fraction, 'depth': depth}}
-	"""
-	trunc_by_ref = {}  # Dictionary to store truncation info per reference
-	if not os.path.exists(pileup_path):  # If pileup file doesn't exist, return empty dict
-		return trunc_by_ref
+    """
+    Detects two types of truncations:
+    1. Clipped reads based truncation
+    2. Low coverage regions (zero or very low coverage over a window)
+    
+    Returns a dict: {ref: {'pos': position, 'depth': depth, 'type': str, 'window_size': int}}
+    """
+    trunc_by_allele = {}
+    if not os.path.exists(pileup_path):
+        return trunc_by_allele
 
-	# Threshold parameters for enhanced truncation detection
-	HIGH_END_FRAC_THRESHOLD = 0.75   # Minimum threshold for read ends (75%) - lowered from original 90%
-	VERY_HIGH_END_FRAC = 0.90        # Very high threshold - no coverage drop needed (90%) - addition
-	COVERAGE_DROP_RATIO = 3.0        # Coverage must drop by at least 3-fold - addition for confirmation
-	#MIN_DEPTH = 10                   # Minimum depth required to consider a position
-	EDGE_PAD = 10                    # Ignore positions within this many bases of the edge
-	WINDOW_SIZE = 10                  # Look ahead window to check coverage drop - addition
+    # Threshold parameters
+    HIGH_END_FRAC_THRESHOLD = 0.70   # Minimum threshold for clipped reads
+    VERY_HIGH_END_FRAC = 0.90        # Very high threshold - no coverage drop needed
+    COVERAGE_DROP_RATIO = 3.0        # Coverage must drop by at least 3-fold
+    MIN_WINDOW_SIZE = 5              # Minimum window size for low coverage regions
+    EDGE_PAD = 10                    # Ignore positions near edges
+    VERY_LOW_COV_RATIO = 0.05        # 5% of mean depth threshold for possible truncation
+    
+    # First pass: collect data and calculate mean depths
+    ref_data = defaultdict(list)
+    ref_mean_depths = defaultdict(float)
+    ref_positions = defaultdict(int)
+    
+    with open(pileup_path, 'r') as f:
+        for line in f:
+            if not line.strip() or line.startswith('#'):
+                continue
+            parts = line.rstrip('\n').split('\t')
+            
+            if len(parts) < 5:
+                continue
+            
+            allele = parts[0]
+            try:
+                pos = int(parts[1])
+                depth = int(parts[3])
+                bases = parts[4] if len(parts) > 4 else ""
+            except:
+                continue
+            
+            ref_data[allele].append({
+                'pos': pos,
+                'depth': depth,
+                'bases': bases
+            })
+            ref_mean_depths[allele] += depth
+            ref_positions[allele] += 1
 
-	# Two-pass approach for better analysis
-	# First pass: collect all pileup data organized by reference
-	# This allows us to look ahead for coverage drops (original was single-pass)
-	ref_data = defaultdict(list)
-	
-	with open(pileup_path, 'r') as f:
-		for line in f:
-			if not line.strip() or line.startswith('#'):
-				continue
-			parts = line.rstrip('\n').split('\t')
-			
-			if len(parts) < 5:
-				continue
-			ref = parts[0]
-			try:
-				pos = int(parts[1]) # position in reference
-				depth = int(parts[3]) # Depth at this position
-				bases = parts[4] if len(parts) > 4 else ""  # Handle missing bases column
-			except:
-				continue
-				
-			# Store all position data for later analysis
-			ref_data[ref].append({
-				'pos': pos,
-				'depth': depth,
-				'bases': bases
-			})
-	
-	# Second pass: analyze each reference for truncations
-	for ref, positions in ref_data.items():
-		L = ref_lengths.get(ref)
-		if L is None:
-			continue
-			
-		# Sort positions by coordinate
-		positions.sort(key=lambda x: x['pos'])
-		
-		for i, pos_data in enumerate(positions):
-			pos = pos_data['pos']
-			depth = pos_data['depth']
-			bases = pos_data['bases']
-			
-			# Skip positions that don't meet basic criteria
-			if depth < MIN_DEPTH:
-				continue
-			if L is not None and (pos <= EDGE_PAD or pos >= (L - EDGE_PAD + 1)):
-				continue
-				
-			# Count reads ending at this position
-			end_count = bases.count('$')
-			frac_end = end_count / float(depth) if depth > 0 else 0.0
-			
-			# Check if this position has sufficient fraction of read ends
-			if frac_end >= HIGH_END_FRAC_THRESHOLD:
-				# Dual criteria approach based on user requirements:
-				# 1. If ≥90% of reads end here, it's a truncation (no coverage drop needed)
-				# 2. If 75-90% of reads end here, check for coverage drop to confirm
-				
-				is_likely_truncation = False
-				
-				if frac_end >= VERY_HIGH_END_FRAC:
-					# Very high fraction (≥90%) - accept as truncation without additional checks
-					# This handles clear truncations where almost all reads end
-					is_likely_truncation = True
-				else:
-					# Moderate fraction (75-90%) - require coverage drop confirmation
-					# This prevents false positives from mixed full/truncated read scenarios
-					coverage_drop_confirmed = False
-					
-					# Look at the next few positions to confirm coverage drop
-					for j in range(i + 1, min(i + 1 + WINDOW_SIZE, len(positions))):
-						next_pos_data = positions[j]
-						next_pos = next_pos_data['pos']
-						next_depth = next_pos_data['depth']
-						
-						# Only consider consecutive or very close positions
-						if next_pos > pos + WINDOW_SIZE:
-							break
-						
-						# Skip very low coverage positions in the comparison
-						if next_depth < 5:
-							continue
-							
-						# Check if coverage dropped significantly (at least 3-fold reduction)
-						# This confirms true truncation vs. mixed mapping scenarios
-						if depth >= next_depth * COVERAGE_DROP_RATIO:
-							coverage_drop_confirmed = True
-							break
-					
-					is_likely_truncation = coverage_drop_confirmed
-				
-				# Store truncation if confirmed by either high fraction or coverage drop
-				if is_likely_truncation:
-					prev = trunc_by_ref.get(ref)
-					if prev is None:
-						trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
-					elif frac_end > prev['frac']:
-						trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
-					elif frac_end == prev['frac'] and depth > prev['depth']:
-						trunc_by_ref[ref] = {'pos': pos, 'frac': frac_end, 'depth': depth}
-	
-	return trunc_by_ref  # Return dictionary of truncation positions per reference
+    # Calculate mean depths
+    for allele in ref_mean_depths:
+        if ref_positions[allele] > 0:
+            ref_mean_depths[allele] /= ref_positions[allele]
 
+    # Second pass: analyze each reference for truncations
+    for allele, positions in ref_data.items():
+        L = ref_lengths.get(allele)
+        if L is None:
+            continue
+            
+        positions.sort(key=lambda x: x['pos'])
+        mean_depth = ref_mean_depths[allele]
+        
+        # Track windows of low coverage
+        current_window = []
+        window_start_pos = None
+        
+        for i, pos_data in enumerate(positions):
+            pos = pos_data['pos']
+            depth = pos_data['depth']
+            bases = pos_data['bases']
+            
+            if L is not None and (pos <= EDGE_PAD or pos >= (L - EDGE_PAD + 1)):
+                continue
+
+            # Check for clipped read based truncation
+            end_count = bases.count('$')
+            frac_end = end_count / float(depth) if depth > 0 else 0.0
+            
+            if frac_end >= HIGH_END_FRAC_THRESHOLD:
+                is_likely_truncation = False
+                if frac_end >= VERY_HIGH_END_FRAC:
+                    is_likely_truncation = True
+                else:
+                    # Check for coverage drop after clipping
+                    coverage_drop_confirmed = False
+                    for j in range(i + 1, min(i + 3, len(positions))):
+                        next_pos_data = positions[j]
+                        if depth >= next_pos_data['depth'] * COVERAGE_DROP_RATIO:
+                            coverage_drop_confirmed = True
+                            break
+                    is_likely_truncation = coverage_drop_confirmed
+                
+                if is_likely_truncation:
+                    prev = trunc_by_allele.get(allele)
+                    new_trunc = {'pos': pos, 'depth': depth, 'type': 'clip'}
+                    if not prev or (prev['type'] == 'clip' and depth > prev['depth']):
+                        trunc_by_allele[allele] = new_trunc
+
+            # Track low coverage windows
+            if depth < mean_depth * VERY_LOW_COV_RATIO:
+                if window_start_pos is None:
+                    window_start_pos = pos
+                current_window.append(depth)
+            else:
+                if current_window:
+                    window_size = len(current_window)
+                    if window_size >= MIN_WINDOW_SIZE:
+                        window_avg = sum(current_window) / window_size
+                        
+                        # Check if window is at gene edges
+                        window_end_pos = window_start_pos + window_size - 1
+                        is_edge_window = (window_start_pos <= EDGE_PAD or 
+                                        (L is not None and window_end_pos >= L - EDGE_PAD))
+                        
+                        # Only process if not at edges
+                        if not is_edge_window:
+                            # If there's any position with 0 coverage in a low coverage window,
+                            # it's a confirmed truncation
+                            has_zero = any(d == 0 for d in current_window)
+                            
+                            if has_zero and window_avg < mean_depth * VERY_LOW_COV_RATIO:
+                                trunc_type = 'TRUNCATED_LOWCOV'
+                            elif window_avg < mean_depth * VERY_LOW_COV_RATIO:
+                                trunc_type = 'POSSIBLE_TRUNCATED_LOWCOV'
+                            else:
+                                trunc_type = None
+                            
+                            # Only record if we found a truncation and it's either:
+                            # 1. The first truncation found for this allele
+                            # 2. A more severe truncation than previously found
+                            # 3. A confirmed truncation replacing a possible one
+                            prev = trunc_by_allele.get(allele)
+                            if trunc_type and (not prev or 
+                                (prev['type'].startswith('POSSIBLE') and not trunc_type.startswith('POSSIBLE')) or
+                                (prev['type'] == trunc_type and window_avg < prev['depth'])):
+                                trunc_by_allele[allele] = {
+                                    'pos': window_start_pos,
+                                    'depth': window_avg,
+                                    'type': trunc_type,
+                                    'window_size': window_size
+                                }
+                
+                current_window = []
+                window_start_pos = None
+
+    return trunc_by_allele
+
+def detect_low_coverage_genes(pileup_path):
+    """
+    Detects genes with low coverage compared to mean depth.
+    Uses threshold approach:
+    - Calculates mean depth across all positions
+    - Flags genes with depth < 10% of mean depth
+    
+    Returns dict: {ref: {'mean_depth': float, 'low_coverage': bool}}
+    """
+    # Parameters for low coverage detection
+    LOW_COV_THRESHOLD = 0.1  # Flag genes with < 10% of mean depth
+    
+    low_cov_by_ref = {}
+    
+    if not os.path.exists(pileup_path):
+        return low_cov_by_ref
+        
+    # Calculate mean depth across all positions
+    total_depth = 0
+    total_positions = 0
+    ref_depths = defaultdict(list)
+    
+    with open(pileup_path, 'r') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            parts = line.strip().split('\t')
+            if len(parts) >= 4:
+                ref = parts[0]
+                depth = int(parts[3])
+                total_depth += depth
+                total_positions += 1
+                ref_depths[ref].append(depth)
+    
+    # Calculate overall mean depth
+    mean_depth = float(total_depth)/total_positions if total_positions > 0 else 0
+    low_cov_cutoff = mean_depth * LOW_COV_THRESHOLD
+    
+    # Check each reference
+    for ref, depths in ref_depths.items():
+        ref_mean = sum(depths)/float(len(depths))
+        low_cov_by_ref[ref] = {
+            'mean_depth': ref_mean,
+            'low_coverage': ref_mean < low_cov_cutoff
+        }
+    
+    return low_cov_by_ref
 #<--- NGG-----------------------------------------
 
 def read_pileup_data(pileup_file, size, prob_err, consensus_file = ""):
@@ -987,6 +1055,7 @@ def calculate_ST(allele_scores, ST_db, gene_names, sample_name, mlst_delimiter, 
 			if diffs != "trun":
 				allele_with_flags+="*" # trun indicates only that a truncated form had lower score, which isn't a mismatch
 			mismatch_flags.append(allele+"/"+diffs)
+#NGG -------------look at code below to cahnge uncertainity flags------------		
 		if depth_problem != "":
 			allele_with_flags+="?"
 			uncertainty_flags.append(allele+"/"+depth_problem)
@@ -1135,7 +1204,9 @@ def dict_of_dicts_inverted_ind(dd):
 def parse_scores(run_type,args,scores, hash_edge_depth,
 					avg_depth_allele, coverage_allele, mismatch_allele, indel_allele,
 					missing_allele, size_allele, next_to_del_depth_allele,
-					unique_cluster_symbols,unique_allele_symbols, pileup_file):
+					unique_cluster_symbols,unique_allele_symbols, pileup_file,
+					trunc_by_allele, low_cov_by_ref ): # NGG changes-------------
+
 
 	# sort into hash for each gene locus
 	scores_by_gene = group_allele_dict_by_gene(dict( (allele,val) for (allele,val) in scores.items() \
@@ -1155,6 +1226,7 @@ def parse_scores(run_type,args,scores, hash_edge_depth,
 		# check if depth is adequate for confident call
 		adequate_depth = False
 		depth_problem = ""
+	
 		if hash_edge_depth[top_allele][0] > args.min_edge_depth and hash_edge_depth[top_allele][1] > args.min_edge_depth:
 			if next_to_del_depth_allele[top_allele] != "NA":
 				if float(next_to_del_depth_allele[top_allele]) > args.min_edge_depth:
@@ -1170,6 +1242,21 @@ def parse_scores(run_type,args,scores, hash_edge_depth,
 				depth_problem="depth"+str(avg_depth_allele[top_allele])
 		else:
 			depth_problem = "edge"+str(min(hash_edge_depth[top_allele][0],hash_edge_depth[top_allele][1]))
+			
+		#>---NGG ------------------------------------------------------
+		# Add truncation flags based on type
+		if top_allele in trunc_by_allele:
+			trunc_info = trunc_by_allele[top_allele]
+			if trunc_info['type'] == 'clip':
+				depth_problem += ";TRUNCATED_CLIP"
+			else:  # TRUNCATED_LOWCOV or POSSIBLE_TRUNCATED_LOWCOV
+				depth_problem += ";" + trunc_info['type']
+				depth_problem += f"(win={trunc_info['window_size']}bp)"
+			
+		# Add low coverage flag for overall low coverage genes
+		if top_allele in low_cov_by_ref and low_cov_by_ref[top_allele]['low_coverage']:
+			depth_problem += ";LOW_DEPTH"
+		#<---NGG ------------------------------------------------------
 
 		# check if there are confident differences against this allele
 		differences = ""
@@ -1199,10 +1286,22 @@ def parse_scores(run_type,args,scores, hash_edge_depth,
 							# next best has score within 10% of this one
 							truncation_override = True
 			if truncation_override:
-				results[gene] = (next_best_allele, "trun", "", divergence) # no diffs but report this call is based on truncation test
+				# >NGG---------------------------
+				#original
+				#results[gene] = (next_best_allele, "trun", "", divergence) # no diffs but report this call is based on truncation test
+				
+				#edited
+				results[gene] = (next_best_allele, "trun", depth_problem, divergence) # no diffs but report this call is based on truncation test
+				# <NGG---------------------------
+
 				final_allele_reported = next_best_allele
 			else:
-				results[gene] = (top_allele, "", "",divergence) # no caveats to report
+				# >NGG---------------------------
+				#original
+				#results[gene] = (top_allele, "", "", divergence) # no caveats to report
+				#edited
+				results[gene] = (top_allele, "", depth_problem, divergence) 
+				# <NGG---------------------------
 
 		# Check if there are any potential new alleles
 		if depth_problem == "" and divergence > 0:
@@ -1616,8 +1715,10 @@ def map_fileSet_to_db(args, sample_name, fastq_inputs, db_name, fasta, size, gen
 
 #>---NGG ------------------------------------------------------
 		# Detectar truncaciones en el pileup
-		trunc_by_ref = detect_truncations_in_pileup(pileup_file, size)
-		#print("Truncados detectados:", trunc_by_ref.keys())
+		trunc_by_allele = detect_truncations_in_pileup(pileup_file, size)
+		#print("Truncados detectados:", trunc_by_allele.keys())
+		# Detect low coverage genes
+		low_cov_by_ref = detect_low_coverage_genes(pileup_file)	
 #<---NGG ------------------------------------------------------
 
 		# Generate scores for all alleles (prints these and associated info if verbose)
@@ -1635,8 +1736,9 @@ def map_fileSet_to_db(args, sample_name, fastq_inputs, db_name, fasta, size, gen
 
 	allele_scores = parse_scores(run_type, args, scores, \
 			hash_edge_depth, avg_depth_allele, coverage_allele, mismatch_allele, \
-			indel_allele, missing_allele, size_allele, next_to_del_depth_allele,
-			unique_gene_symbols, unique_allele_symbols, pileup_file)
+			indel_allele, missing_allele, size_allele, next_to_del_depth_allele, \
+			unique_gene_symbols, unique_allele_symbols, pileup_file, \
+			trunc_by_allele, low_cov_by_ref) #NGG changes ------------------
 
 	# REPORT/RECORD RESULTS
 
@@ -1692,21 +1794,11 @@ def map_fileSet_to_db(args, sample_name, fastq_inputs, db_name, fasta, size, gen
 					results[sample_name][column_header] += "*"
 				if depth_problem != "":
 					results[sample_name][column_header] += "?"
-				#>---NGG ------------------------------------------------------
-				# Anyade *trunc si el gen esta truncado
-				if allele in trunc_by_ref.keys():
-					#results[sample_name][column_header] += "*trunc" # para report genes
-					# print("Gen truncado detectado:", allele, "->", results[sample_name][column_header])
-					#allele_name += "*trunc"  # <-- Anyade aqui para fullgenes
-					diffs += ";TRUNCATED" 
-
-				#<---NGG ------------------------------------------------------
 				if column_header not in gene_list:
 					gene_list.append(column_header)
 
 			# write details to full genes report
 			if args.no_gene_details:
-
 				# get annotation info
 				header_string = os.popen(" ".join(["grep",allele,fasta]))
 				try:
@@ -1719,9 +1811,9 @@ def map_fileSet_to_db(args, sample_name, fastq_inputs, db_name, fasta, size, gen
 
 				except:
 					annotation = ""
-
+				#NGG print("before writing:", gene_name, "ALLELE:", allele_name, "DEPTH_PROBLEM:", depth_problem)
 				f.write("\t".join([sample_name,db_name,gene_name,allele_name,str(round(coverage_allele[allele],3)),str(avg_depth_allele[allele]),diffs,depth_problem,str(round(divergence*100,3)),str(size_allele[allele]),str(round(mix_rates[allele],3)),cluster_id,seqid,annotation])+"\n")
-
+				
 		# log the gene detection result
 		logging.info(" " + str(len(allele_scores)) + " genes identified in " + sample_name)
 
@@ -1855,6 +1947,11 @@ def compile_results(args,mlst_results,db_results,compiled_output_file):
 
 
 def main():
+	#>NGG ------------------------------------------------------
+	# Add version print at the start
+	print("Running SRST2 version NGG with truncation and low coverage detection")
+	#<NGG ------------------------------------------------------
+
 	args = parse_args()
 
 	# Check output directory
